@@ -1,0 +1,2532 @@
+#include <LiquidCrystal.h>
+#include <EEPROM.h>
+#include <SoftwareSerial.h>
+SoftwareSerial CAN(10, 11);
+#include <EasyTransfer.h>
+EasyTransfer ETin, ETout;
+#include "RGBdriver.h"
+RGBdriver Driver(51, 52);
+
+/*----------------------------Распиновка-----------------------------------—
+0,1 - не используются
+2,3,4,5,6,7 - дисплей
+8,9 - кнопки навигации
+10,11,12 - не используюстся
+13 - итерационный диод
+14,15,16,17 - не используем
+18,19 - HOBD uart
+20,21 - не используем
+22,23,24,25,26,27,28,29 - головной блок-реле
+30,31,32,33 - кнопка старт/стоп
+34,35 - FIC-контроллер
+51,52,53 - хз
+50 - реле антенны иммобилайзера
+
+А0 - датчик нейтрали
+А1 - датчик света
+
+-----------------------------Система запуска------------------------------*/
+
+int ENGINE_START_MAX_TIME = 500; //Максимальное время стартера
+int ENGINE_WORK_MAX_TIME = 900; //Максимальное время работы двигателя без водителя
+unsigned long ENGINE_NEXT_OIL_SERVICE = 218000, ENGINE_AIR_FILTER_SERVICE = 218000;
+
+LiquidCrystal lcd(2, 3, 4, 5, 6, 7);
+
+const int pwr_out = 22, ign1_out = 23, ign2_out = 24, start_out = 25;
+const int Plight_out = 29, Head_out = 26, Fog_out = 28;
+
+const int knob = 30, knob_blue = 31, knob_red = 32, knob_green = 33;
+const int ledPin = 13, immo_ant = 50, Buz_out = 49;
+const int neutral = A0; // настроить на условие для завода
+const int fotoPin = A1;
+
+String currStr;
+char currSymb = 0;
+int last_cash = 0;
+unsigned long currMillis_secs_till_100 = 0, prevMillis_secs_till_100 = 0, shutdown_delay_millis = 0, voltage_alarm_millis = 0, rgb_mode_millis = 0;
+float time_result_secs_till_100 = 0;
+boolean show = false, Boost = false, Booster_function = true, shutdown_delay_function = false, speed_alarm_activated = false, light_changing = false, anti_lag = false;
+unsigned int boost_set = 2000, shutdown_delay_counter = 0, button_counter = 0, button_delay = 300;
+unsigned int start_stop_counter = 0, rpm_boost_set = 2000, backlight_colour = 0, backlight_brightness = 255, rgb_mode_brightness = 255;
+boolean light_function = true, Head_on = true, started_from_gsm = false;
+int brightness = 0, check_lum = 0, light_delay_set = 2000, start_stop_vss_counter = 0, rgb_mode = 0;
+unsigned long prevMillis_knob = 0, last_display_update_data_millis = 0;
+boolean on_knob_light = false, start_stop_enabled = false, multiJoy = false, hot_start = false, rpm_alarm_active = false, rpm_alarm_light = true;
+unsigned long last_hot_start_millis = 0, start_stop_delay = 15000, rpm_alarm_millis = 0;
+
+//----------------------------Бортовик----------------------—
+int NPage = 1, NPage1 = 1, NPage2 = 1, display_update_data_counter = 0;
+boolean display_on = false, ecu_read_data = false, display_update_data = true, ride_fast = false, temp_cool_lighting = false;
+boolean NPage_show = false, NPage1_show = false;
+boolean relay_1 = false, relay_2 = false, relay_3 = false, relay_4 = false, relay_5 = false;
+const int btn1 = 8, btn2 = 9, joystickX = A4, joystickY = A5, joystickBUT = A6;
+boolean ForwardX = false, BackwardX = false, ForwardY = false, BackwardY = false, ForwardY_released = true, BackwardY_released = true, JoyBUT_released = true;
+int osX = 500, osY = 500;
+boolean JoyBUT = false;
+boolean BUTTON_1 = false, BUTTON_2 = false;
+boolean KNOB_PRESSED = false, KNOB_PRESSED_LONG = false;
+
+unsigned long LAST_TIME_STARTED = 0, ACTUAL_TIME_WORKING = 0, firstMillis = 0, main_distance;
+int actual_mode = 0, left_start_try = 0, rpm = 0, vss = 0, last_vss = 0, temp_cool = 0, temp_air = 0, thr_pos = 0, ign = 0, gear = 0;
+float pos_egr, abs_pres = 0, atm_pres = 0, volt_lz1 = 0, volt_net = 12.0, load_gen = 0, time_inj = 0, valv_idle = 0, load_eld = 0;
+float distance, afterstart_dist = 0, afterstart_fuel = 0, middle_speed = 0, fuelmed, dist_short = 0, fuel_short = 0, fuelmed_short = 0;
+float fuelc = 0, fuelsc = 0, fuel_tank = 0, fuel_left = 0, dist_left = 0, main_distance_plus, acceleration, fuel_price = 32.0, dist_price = 9.0, fuel_money, dist_money;
+int read_data = 0, iteration_print, read_data_millis = 35, read_data_errors = 20, read_data_errors_max = 28, fuel_added = 35;
+int st_corr, lt_corr;
+int dis08, dis09, dis0A, dis0B, dis0C, dis0D, dis0E, dis0F;
+
+// Это пять символов для шкалы
+byte S_1[8] = { B10000, B10000, B10000, B10000, B10000, B10000, B10000, B10000,};
+byte S_2[8] = { B11000, B11000, B11000, B11000, B11000, B11000, B11000, B11000,};
+byte S_3[8] = { B11100, B11100, B11100, B11100, B11100, B11100, B11100, B11100,};
+byte S_4[8] = { B11110, B11110, B11110, B11110, B11110, B11110, B11110, B11110,};
+byte S_5[8] = { B11111, B11111, B11111, B11111, B11111, B11111, B11111, B11111,};
+
+//------------------Создаем наши символы-------------------—
+byte temp[8] = { B00111, B00100, B00111, B00100, B00111, B00100, B00100, B11111,};
+byte bar[8] = { B00000, B01110, B10011, B10101, B10001, B01110, B00100, B01110,};
+byte lamb[8] = { B00000, B01000, B00100, B00100, B00010, B00110, B01001, B10001,};
+
+void UpdateData()
+{
+  read_data++;
+  int nbyte, i;
+
+  switch (read_data) {
+    case 1:
+      {
+        nbyte = Serial1.available();
+        check_data24(nbyte);
+        honda_write_data(0x00, 0x10); //00-0f ЗАПРОС НА ОБОРОТЫ ДВИГАТЕЛЯ И СКОРОСТЬ
+        break;
+      }
+    case 2:
+      {
+        nbyte = Serial1.available();
+        if (nbyte > 0 && check_data24(nbyte)) honda_read_data_00_0f(); // ЧТЕНИЕ ПОСЛЕДНЕГО ЗАПРОСА
+        else read_data_errors++;
+        honda_write_data(0x10, 0x10); //10-1f ЗАПРОС НА ТЕМПЕРАТУРЫ, ДАВЛЕНИЯ, ТПС, НАПРЯЖЕНИЕ
+        break;
+      }
+    case 3:
+      {
+        nbyte = Serial1.available();
+        if (nbyte > 0 && check_data24(nbyte)) honda_read_data_10_1f(); // ЧТЕНИЕ ПОСЛЕДНЕГО ЗАПРОСА
+        else read_data_errors++;
+        honda_write_data(0x20, 0x10); //20-2f ЗАПРОС НА ВРЕМЯ ОТКРЫТИЯ ФОРСУНОК, КХХ
+        break;
+      }
+    case 4:
+      {
+        nbyte = Serial1.available();
+        if (nbyte > 0 && check_data24(nbyte)) {
+          honda_read_data_20_2f(); // ЧТЕНИЕ ПОСЛЕДНЕГО ЗАПРОСА
+          calculate_data();
+          if (read_data_errors > 0) read_data_errors = 0;
+        }
+        else read_data_errors++;
+        read_data = 0;
+        break;
+      }
+  }
+  if (read_data_errors >= read_data_errors_max) {
+    if (actual_mode == 0) read_data_errors = 0;
+    else if (actual_mode == 1 || actual_mode == 2) {
+      ENGINE_START_MAX_TIME = 200;
+      read_data_errors = 0;
+    }
+    else {
+      read_data_errors = 0;
+      if (digitalRead(start_out)) digitalWrite(start_out, LOW);
+      lcd.clear();
+      lcd.setCursor(0, 0); lcd.print("READ DATA ERROR!");
+      lcd.setCursor(0, 1); lcd.print("READ DATA ERROR!");
+      delay(500);
+    }
+  }
+  else ENGINE_START_MAX_TIME = 500;
+}
+
+void calculate_data()
+{
+  static float const iteration = (read_data_millis * 4);
+  iteration_print = iteration;
+  //if (Boost) time_inj += (float)(boost_set / 1000);
+  fuelsc = 230.0 * (float)rpm * time_inj * 0.000002;
+  if (vss > 0) fuelc = fuelsc * 100.0 / ((float)vss);
+  else fuelc = 0;
+  float last_inj = (fuelsc * iteration) / 3600000.0;
+  fuel_tank += last_inj;  fuel_short += last_inj;  afterstart_fuel += last_inj;
+  float last_dist = ((float)vss * iteration) / 3600000.0;
+  distance += last_dist;  dist_short += last_dist;
+  afterstart_dist += last_dist;  main_distance_plus += last_dist;
+  if (main_distance_plus >= 1.0) {
+    main_distance++;
+    main_distance_plus = 0;
+  }
+  fuelmed = (fuel_tank / distance) * 100.0;
+  fuelmed_short = (fuel_short / dist_short) * 100.0;
+  fuel_left = fuel_added - fuel_tank;
+  dist_left = (fuel_left / fuelmed) * 100.0;
+  gear = (vss * 150) / rpm + 0.2;
+  fuel_money = afterstart_fuel * fuel_price;  dist_money = afterstart_dist * dist_price;
+  middle_speed = (afterstart_dist / ACTUAL_TIME_WORKING) * 3600;
+  static unsigned int acceleration_counter = 0;
+  acceleration_counter++;
+  if (acceleration_counter >= 4) {
+    acceleration_counter = 0;
+    acceleration = ((vss - last_vss) * 1000) / (14.4 * iteration);
+    last_vss = vss;
+  }
+}
+
+struct RECEIVE_DATA_STRUCTURE {
+  int received;
+};
+struct SEND_DATA_STRUCTURE {
+  unsigned int wait;
+  boolean pause;
+  boolean antiLag;
+};
+RECEIVE_DATA_STRUCTURE rx;
+SEND_DATA_STRUCTURE tx;
+
+//-------------------------------------Пошла настройка---------------------------—
+
+void setup()
+{
+  pinMode(btn1, INPUT_PULLUP);
+  pinMode(btn2, INPUT_PULLUP);
+  pinMode(neutral, INPUT_PULLUP);
+  pinMode(joystickBUT, INPUT_PULLUP);
+  pinMode(knob, INPUT_PULLUP);
+  pinMode(knob_red, OUTPUT);
+  pinMode(knob_green, OUTPUT);
+  pinMode(knob_blue, OUTPUT);
+  pinMode(pwr_out, OUTPUT);
+  pinMode(ign1_out, OUTPUT);
+  pinMode(ign2_out, OUTPUT);
+  pinMode(start_out, OUTPUT);
+  pinMode(Plight_out, OUTPUT);
+  pinMode(Head_out, OUTPUT);
+  pinMode(Fog_out, OUTPUT);
+  pinMode(ledPin, OUTPUT);
+  pinMode(Buz_out, OUTPUT);
+  pinMode(immo_ant, OUTPUT);
+  digitalWrite(immo_ant, LOW);
+
+  digitalWrite(knob_red, HIGH); digitalWrite(knob_blue, HIGH); digitalWrite(knob_green, HIGH);
+
+  Serial.begin(9600);
+  Serial1.begin(9600); // порт UART OBD-1 для общения с ECU
+  Serial2.begin(9600); // порт UART для общения с GSM Arduino UNO
+  CAN.begin(115200); // порт UART для общения с Fuel Injection Controller
+  ETin.begin(details(rx), &CAN);
+  ETout.begin(details(tx), &CAN);
+
+  tx.pause = false;  tx.wait = 0; tx.antiLag = false;
+  ETout.sendData();
+
+  lcd.begin(16, 2);
+  lcd.createChar(0, S_1);
+  lcd.createChar(1, S_2);
+  lcd.createChar(2, S_3);
+  lcd.createChar(3, S_4);
+  lcd.createChar(5, S_5);
+  lcd.createChar(6, temp);
+  lcd.createChar(7, lamb);
+
+  eeprom_read();
+
+  Driver.begin();
+  Driver.SetColor(0, 0, 0); //Lights off
+  Driver.end();
+
+  buzzer(5);
+
+  OCR0A = 0xAF;
+  TIMSK0 |= _BV(OCIE0A);
+}
+
+
+SIGNAL(TIMER0_COMPA_vect)
+{
+  if (millis() - firstMillis >= read_data_millis) {
+    display_update_data_counter++;
+    firstMillis = millis();
+    if (ecu_read_data) UpdateData();
+    if (display_update_data_counter >= 2) {
+      Joystick_check();
+      display_update_data = true;
+    }
+  }
+}
+
+//---------------------------------------------loop------------------------------—
+
+void loop()
+{
+  button_check();
+  gsm_read();
+
+  switch (actual_mode) {
+    case 0:     //Режим ожидания команды на включение
+      {
+        check_pwr();
+        shutdown_delay();
+        break;
+      }
+    case 1:     //Второе положение ключа, зажигание включено
+      {
+        obd1();
+        booster();
+        voltage_alarm(11.4);
+        multi_joystick();
+        ignition();
+        start_stop_function();
+        rgb_modes();
+        break;
+      }
+    case 2:     //Процедура запуска двигателя
+      {
+        do_start();
+        break;
+      }
+    case 3:     //Двигатель запущен, ожидание команды на отключение
+      {
+        obd1();
+        booster();
+        head_light();
+        multi_joystick();
+        rgb_modes();
+        check_stop();
+        start_stop_function();
+        speed_alarm(55, 60);
+        rpm_alarm(6000);
+        ride_fast_alarm(75);
+        if (light_changing) {
+          if (temp_cool_lighting) backLight_changing(temp_cool, 0, 75, 1);
+          else  backLight_changing(vss, 130, 180, 0);
+        }
+        Anti_Lag();
+        break;
+      }
+  }
+  if (actual_mode != 0 || display_on) {
+    static boolean onLed;
+    digitalWrite(ledPin, onLed);
+    onLed = !onLed;
+  }
+}
+
+//---------------------------------------Подпрограммы автозапуска-------------------------------------------------------------------—
+void Joystick_check()
+{
+  static unsigned long X_button_millis = 0;
+  
+  if (ForwardX || BackwardX || ForwardY || BackwardY) ForwardX = false; BackwardX = false; ForwardY = false; BackwardY = false;
+
+  if (analogRead(joystickX) < 50) {
+    if (millis() - X_button_millis > button_delay) {
+      X_button_millis = millis(); ForwardX = true;
+    }
+  }
+  else if (analogRead(joystickX) > 970) {
+    if (millis() - X_button_millis > button_delay) {
+      X_button_millis = millis(); BackwardX = true;
+    }
+  }
+  else X_button_millis = 0;
+
+  if (analogRead(joystickY) > 970) {
+    if (ForwardY_released)    ForwardY = true; ForwardY_released = false;
+  }
+  else if (analogRead(joystickY) < 50) {
+    if (BackwardY_released)   BackwardY = true; BackwardY_released = false;
+  }
+  else {
+    ForwardY_released = true;    BackwardY_released = true;
+  }
+
+  if (ForwardX || BackwardX || ForwardY || BackwardY || BUTTON_1 || BUTTON_2) buzzer(4);
+}
+
+void button_check() {
+  if (BUTTON_1 || BUTTON_2) {
+    BUTTON_1 = false; BUTTON_2 = false;
+  }
+
+  while (!digitalRead(btn1)) BUTTON_1 = true;
+  while (!digitalRead(btn2)) BUTTON_2 = true;
+
+  if (!digitalRead(joystickBUT)) {
+    if (JoyBUT_released) {
+      JoyBUT = true; JoyBUT_released = false; buzzer(4);
+    }
+  }
+  else JoyBUT_released = true;
+
+  if (!digitalRead(knob)) {
+    knob_light_off();
+    lcd.display(); lcd.clear();
+    if (!digitalRead(Plight_out) || !digitalRead(pwr_out)) {
+      digitalWrite(pwr_out, HIGH);
+      digitalWrite(Plight_out, HIGH);
+      digitalWrite(knob_blue, HIGH);
+    }
+    KNOB_PRESSED = true;
+    delayButReleased(knob, 400);
+    lcd.setCursor(2, 0);   lcd.print("Start button");
+    for (int secs = 0; secs <= 80; secs++) {
+      knob_RGB(knob_blue, 32);
+      show_scale(secs, 0, 80, 16);
+      if (delayButReleased(knob, 8)) break;
+      if (secs == 80) {
+        KNOB_PRESSED_LONG = true;
+        break;
+      }
+    }
+    knob_light_off();
+  }
+}
+
+void check_pwr()
+{
+  if (KNOB_PRESSED)
+  {
+    if (KNOB_PRESSED_LONG) {
+      digitalWrite(ign1_out, HIGH);      digitalWrite(ign2_out, HIGH);
+      knob_light_off();
+      digitalWrite(knob_green, HIGH);
+      lcd.clear();      lcd.print("IGNITION ENABLED");
+      lcd.setCursor(1, 1);      lcd.print("Ready to start");
+      actual_mode = 1;
+      if (!display_on)  lighting_get_up(1);
+      read_data = 0;  firstMillis = 0;  ecu_read_data = true;
+      actual_mode = 1;
+    }
+    else {
+      digitalWrite(ign1_out, HIGH);      digitalWrite(ign2_out, HIGH);
+      lcd.clear();
+      lcd.setCursor(0, 0); lcd.print("WELCOME ON BOARD");
+      lcd.setCursor(0, 1); lcd.print("Ignition enabled");
+      if (!display_on) lighting_get_up(1);
+      read_data = 0;  firstMillis = 0;  ecu_read_data = true;
+      actual_mode = 2;  left_start_try = 1;
+    }
+    KNOB_PRESSED = false;
+    KNOB_PRESSED_LONG = false;
+    while (digitalRead(knob) == LOW) {}
+  }
+
+  if (JoyBUT && !display_on) {
+    JoyBUT = false;
+    display_on = true;
+    digitalWrite(pwr_out, HIGH); digitalWrite(Plight_out, HIGH);
+    lcd.display(); lcd.clear();
+    lcd.setCursor(2, 0); lcd.print("Apple Accord");
+    lcd.setCursor(1, 1); lcd.print("Light Enabled");
+    lighting_get_up(0);
+  }
+  else if (JoyBUT && display_on) {
+    JoyBUT = false;
+    display_on = false;
+    lcd.clear();
+    lcd.setCursor(2, 0); lcd.print("Apple Accord");
+    lcd.setCursor(1, 1); lcd.print("Light Disabled");
+    lighting_get_down(0);
+    digitalWrite(pwr_out, LOW); digitalWrite(Plight_out, LOW);
+    lcd.noDisplay();
+    knob_light_off();
+  }
+  if (display_on) {
+    rgb_modes();
+    knob_RGB(knob_red, 500);
+    obd1();
+  }
+}
+
+
+void lighting_get_up(unsigned int light_delay) {
+  for (int i = 0; i < 51; i++) {
+    Driver.begin();    Driver.SetColor(0, i, 0);    Driver.end();
+    delay(light_delay);
+  }
+  for (int i = 51; i <= 255; i = i + 2) {
+    Driver.begin();    Driver.SetColor(0, i, 0);    Driver.end();
+    delay(light_delay);
+  }
+}
+void lighting_get_down(unsigned int light_delay) {
+  for (int i = 255; i > 51; i = i - 2) {
+    Driver.begin();    Driver.SetColor(0, i, 0);    Driver.end();
+    delay(light_delay);
+  }
+  for (int i = 51; i >= 0; i--) {
+    Driver.begin();    Driver.SetColor(0, i, 0);    Driver.end();
+    delay(light_delay);
+  }
+}
+
+
+void ignition()
+{
+  knob_RGB(knob_green, 300);
+  if (KNOB_PRESSED) {
+    if (KNOB_PRESSED_LONG) do_shutdown();
+    else {
+      read_data = 0;      firstMillis = 0;      ecu_read_data = true;
+      digitalWrite(pwr_out, HIGH);
+      actual_mode = 2;      left_start_try = 1;
+    }
+    KNOB_PRESSED = false;    KNOB_PRESSED_LONG = false;
+  }
+}
+
+
+
+
+void do_start() //режим ожидания запуска двигателя
+{
+  if (left_start_try > 0)
+  {
+    if (!hot_start) {
+      rx.received = false; tx.pause = false; tx.wait = 0;
+      while (!rx.received) {
+        ETout.sendData();
+        ETin.receiveData();
+      }
+      rx.received = false;
+      lcd.clear();
+      lcd.setCursor(0, 0);      lcd.print("WELCOME ON BOARD");
+      lcd.setCursor(0, 1);      lcd.print("Ignition enabled");
+      delay(200);
+      if (millis() - shutdown_delay_millis > 7200000 || temp_cool < 70) {
+        NPage = 1; NPage1 = 1; NPage2 = 8;   ride_fast = true;
+        temp_cool_lighting = true;
+        delay(1000);
+      }
+    }
+    else hot_start = false;
+    if (rpm < 100) {
+      digitalWrite(ign1_out, LOW);      digitalWrite(ign2_out, HIGH);
+      digitalWrite(start_out, HIGH);
+      knob_light_off();
+      lcd.display();      lcd.clear();
+      lcd.setCursor(0, 0); lcd.print("WELCOME ON BOARD");
+      lcd.setCursor(1, 1); lcd.print("Starter enabled");
+
+      //-----------------------------------считываем обороты----------------------—
+      for (int secs = 0; secs <= ENGINE_START_MAX_TIME; secs++)
+      {
+        knob_RGB(knob_blue, 40);
+        delay(10);
+        if (rpm > 600) break;
+        if (!digitalRead(knob) || vss > 0) {
+          left_start_try = 1;
+          break;
+        }
+      }
+      digitalWrite(start_out, LOW);
+      knob_light_off();
+      if (rpm > 600) {
+        lcd.clear();
+        lcd.setCursor(1, 0);        lcd.print("ENGINE STARTED");
+        lcd.setCursor(2, 1);        lcd.print("SUCCESSFULLY");
+        digitalWrite(ign1_out, HIGH);
+        digitalWrite(immo_ant, LOW);
+        digitalWrite(knob_green, HIGH);
+        delay(300);        buzzer(1);
+        if (rpm < 600)  left_start_try--;
+      }
+      else left_start_try--;
+    }
+    else {
+      lcd.clear();
+      lcd.setCursor(1, 0); lcd.print("ENGINE ALREADY");
+      lcd.setCursor(5, 1); lcd.print("STARTED");
+      digitalWrite(knob_green, HIGH);
+      buzzer(3); delay(120);
+      buzzer(3); delay(120);
+      buzzer(3); delay(120);
+    }
+    if (left_start_try == 0) {
+      do_shutdown();
+      return;
+    }
+    LAST_TIME_STARTED = millis();
+    afterstart_fuel = 0;        afterstart_dist = 0;      display_on = false;
+    if (!started_from_gsm) {
+      if (analogRead(fotoPin) > 850) Head_on = false;
+      else Head_on = true;
+      digitalWrite(Head_out, Head_on);    digitalWrite(Fog_out, !Head_on);
+    }
+    else light_function = false;
+    actual_mode = 3;
+    rgb_mode = 0;
+    knob_light_off();
+  }
+} // конец процедуры старта
+
+
+
+void check_stop()
+{
+  ACTUAL_TIME_WORKING = millis();
+  ACTUAL_TIME_WORKING -= LAST_TIME_STARTED;
+  ACTUAL_TIME_WORKING /= 1000;
+  if (started_from_gsm)  {  //-------------------------система защиты от воров и таймер на остановку мотора
+    knob_RGB(knob_blue, 500);
+    GSM_Signal();
+    if (thr_pos > 1)  {
+      do_shutdown();
+      //SMS_send(3);
+    }
+    else if (ACTUAL_TIME_WORKING > ENGINE_WORK_MAX_TIME)   do_shutdown();
+    else if (KNOB_PRESSED)  {
+      knob_light_off();      digitalWrite(knob_green, HIGH);
+      lcd.clear();
+      lcd.setCursor(0, 0);      lcd.print("WELCOME ON BOARD");
+      lcd.setCursor(1, 1);      lcd.print("Alarm disabled");
+      buzzer(1);      lighting_get_up(0);
+      if (analogRead(fotoPin) > 850) Head_on = false;
+      else Head_on = true;
+      digitalWrite(Head_out, Head_on);    digitalWrite(Fog_out, !Head_on);
+      started_from_gsm = false;   light_function = true;
+      KNOB_PRESSED = false;      KNOB_PRESSED_LONG = false;
+      knob_light_off();      delay(500);
+    }
+  }
+  else  {
+    if (temp_air < 40.0) knob_RGB(knob_green, 500);
+    else if (!digitalRead(knob_green)) digitalWrite(knob_green, HIGH);
+    if (KNOB_PRESSED) {
+      if (KNOB_PRESSED_LONG) {
+        knob_light_off();
+        lcd.clear(); lcd.setCursor(3, 0); lcd.print("Hot Start");
+        lcd.setCursor(4, 1); lcd.print("Enabled");
+        tx.pause = true; tx.wait = 0;
+        while (rpm > 0) {
+          ETout.sendData(); ETin.receiveData();
+        }
+        rx.received = false;
+        rpm = 0; actual_mode = 1; hot_start = true;
+        for (int i = 0; i < 3; i++) {
+          delay(300);  lcd.noDisplay();  if (!digitalRead(knob)) break;
+          delay(300);  lcd.display();    if (!digitalRead(knob)) break;
+        }
+        tx.pause = false;
+        while (!rx.received) {
+          ETout.sendData();
+          ETin.receiveData();
+        }
+        rx.received = false;
+      }
+      else do_shutdown();
+      KNOB_PRESSED = false; KNOB_PRESSED_LONG = false;
+    }
+  }
+}
+
+void do_shutdown()
+{
+  digitalWrite(ign1_out, LOW);  digitalWrite(ign2_out, LOW);
+  digitalWrite(start_out, LOW);
+  digitalWrite(Head_out, LOW);  digitalWrite(Fog_out, LOW);
+  digitalWrite(knob_red, HIGH);
+  Boost = false; ecu_read_data = false; read_data = 0; display_on = false; multiJoy = false;
+  actual_mode = 0; left_start_try = 0; ACTUAL_TIME_WORKING = 0; rpm = 0; vss = 0; time_inj = 0; firstMillis = 0; read_data_errors = 0;
+  ForwardX = false; BackwardX = false; ForwardY = false; BackwardY = false;
+  KNOB_PRESSED = false; KNOB_PRESSED_LONG = false; knob_light_off();
+  light_function = true;
+  lcd.clear();
+  lcd.setCursor(3, 0); lcd.print("ENGINE OFF");
+  lcd.setCursor(1, 1); lcd.print("Remove the key");
+  buzzer(2);
+  delay(300);
+  calculate_data();
+  tx.wait = 0;  tx.antiLag = false; tx.pause = false;
+  ETout.sendData();
+  eeprom_write();
+  delay(500);
+  if (started_from_gsm) {
+    lighting_get_down(5);
+    digitalWrite(pwr_out, LOW);      digitalWrite(Plight_out, LOW);      digitalWrite(ledPin, LOW);
+    lcd.noDisplay();      knob_light_off();   started_from_gsm = false;
+  }
+  else {
+    shutdown_delay_counter = 0;
+    shutdown_delay_millis = millis();
+    shutdown_delay_function = true;
+    lcd.clear();  lcd.setCursor(0, 0);
+    lcd.print("Light Waiting...");  lcd.setCursor(0, 1);
+  }
+}
+
+
+void shutdown_delay()
+{
+  if (!shutdown_delay_function) return;
+  if (anyButPushed()) {
+    display_on = true;    shutdown_delay_function = false;
+    delay(200);
+    return;
+  }
+  if (millis() - shutdown_delay_millis >= 175 && shutdown_delay_counter < 17) {
+    shutdown_delay_millis = millis();
+    shutdown_delay_counter++;
+    lcd.write((byte)5);
+    if (shutdown_delay_counter > 16) {
+      lcd.clear();
+      lcd.setCursor(3, 0);   lcd.print("Power OFF");
+      lcd.setCursor(4, 1);   lcd.print("Good Bye");
+      lighting_get_down(5);
+      digitalWrite(pwr_out, LOW);      digitalWrite(Plight_out, LOW);      digitalWrite(ledPin, LOW);
+      lcd.noDisplay();
+      knob_light_off();      shutdown_delay_function = false;
+    }
+  }
+}
+
+
+void start_stop_function()
+{
+  if (hot_start && thr_pos > 2.0) {
+    tx.pause = false; rx.received = false;
+    while (!rx.received) {
+      ETout.sendData();
+      ETin.receiveData();
+    }
+    rx.received = false;
+    last_hot_start_millis = millis();
+    actual_mode = 2; left_start_try = 1;
+  }
+
+  if (!start_stop_enabled) return;
+
+  if (millis() - last_hot_start_millis > start_stop_delay && honda_was_riding()) {
+    if (thr_pos == 0 && vss == 0 && temp_cool > 60 && temp_cool < 95 && rpm > 500 && rpm < 1000) start_stop_counter++;
+  }
+  if (start_stop_counter > 100) {
+    start_stop_counter = 0;
+    start_stop_vss_counter = 0;
+    tx.pause = true; tx.wait = 0;
+    while (!rx.received) {
+      ETout.sendData(); ETin.receiveData();
+    }
+    rx.received = false;
+    rpm = 0; actual_mode = 1; hot_start = true;
+    knob_light_off();
+    lcd.clear(); lcd.setCursor(3, 0); lcd.print("Hot Start");
+    lcd.setCursor(4, 1); lcd.print("Enabled");
+    for (int i = 0; i < 3; i++) {
+      delay(300); lcd.noDisplay();  if (!digitalRead(knob)) break;
+      delay(300); lcd.display();    if (!digitalRead(knob)) break;
+    }
+    tx.pause = false;
+    while (!rx.received) {
+      ETout.sendData();
+      ETin.receiveData();
+    }
+    rx.received = false;
+  }
+}
+
+boolean honda_was_riding()
+{
+  if (vss > 10 && start_stop_vss_counter < 100) start_stop_vss_counter++;
+  if (start_stop_vss_counter >= 100) return 1;
+  else return 0;
+}
+
+void speed_alarm(int min_vss, int max_vss) {
+  if (vss > max_vss && !speed_alarm_activated) {
+    buzzer(8);
+    speed_alarm_activated = true;
+  }
+  else if (vss < min_vss && speed_alarm_activated) speed_alarm_activated = false;
+}
+
+void head_light()
+{
+  static unsigned long light_millis = 0;
+  if (!light_function || millis() - light_millis < light_delay_set / 20) return;
+  light_millis = millis();
+  brightness = analogRead(fotoPin);
+  static boolean switch_on_lights = false;
+  if (!digitalRead(Head_out) && !digitalRead(Fog_out)) {
+    if (vss == 0 && !switch_on_lights) switch_on_lights = true;
+    else if (vss > 0 && switch_on_lights) {
+      if (analogRead(fotoPin) > 850) Head_on = false;
+      else Head_on = true;
+      digitalWrite(Head_out, Head_on);
+      digitalWrite(Fog_out, !Head_on);
+      switch_on_lights = false;
+    }
+  }
+  if (brightness > 870 && check_lum < 10) check_lum++;
+  else if (brightness < 780 && check_lum > -10) check_lum--;
+
+  if (check_lum >= 10 && Head_on) {
+    buzzer(3);    Head_on = false;
+    digitalWrite(Head_out, Head_on);
+    digitalWrite(Fog_out, !Head_on);
+  }
+  else if (check_lum <= -10 && !Head_on) {
+    buzzer(3);    Head_on = true;
+    digitalWrite(Head_out, Head_on);
+    digitalWrite(Fog_out, !Head_on);
+  }
+}
+
+void rpm_alarm(int rpm_max) {
+  if (gear == 1) rpm_max = rpm_max - 500;
+  if (rpm > rpm_max && !rpm_alarm_active) rpm_alarm_active = true;
+  else if (rpm < rpm_max && rpm_alarm_active) {
+    Driver.begin();    Driver.SetColor(0, 255, 0);    Driver.end();
+    rpm_alarm_light = true;    rpm_alarm_active = false;
+  }
+  if (rpm_alarm_active && rpm_alarm_millis - millis() > 100) {
+    rpm_alarm_millis = millis();    rpm_alarm_light = !rpm_alarm_light;
+    if (rpm_alarm_light) {
+      Driver.begin();      Driver.SetColor(255, 0, 0);      Driver.end();
+      buzzer(9);
+    }
+    else {
+      Driver.begin();      Driver.SetColor(0, 0, 0);      Driver.end();
+    }
+  }
+}
+
+void knob_RGB(int colour, int timer)
+{
+  if (millis() - prevMillis_knob > timer) {
+    static boolean on_knob_light;
+    digitalWrite(colour, on_knob_light);
+    prevMillis_knob = millis();    on_knob_light = !on_knob_light;
+  }
+}
+
+
+void knob_light_off()
+{
+  digitalWrite(knob_red, LOW);   digitalWrite(knob_blue, LOW);   digitalWrite(knob_green, LOW);
+  on_knob_light = false;
+}
+
+
+void voltage_alarm(float min_volts)
+{
+  if (volt_net < min_volts && millis() - voltage_alarm_millis > 10000) {
+    voltage_alarm_millis = millis();
+    lcd.clear();
+    lcd.setCursor(1, 0);    lcd.print("LOW VOLTAGE!!!");
+    lcd.setCursor(5, 1);    lcd.print(volt_net);    lcd.print("V");
+    delay(300);
+    while (volt_net < min_volts) {
+      if (millis() - voltage_alarm_millis == 300) lcd.noDisplay();
+      if (millis() - voltage_alarm_millis > 600) {
+        buzzer(7);
+        voltage_alarm_millis = millis();
+        lcd.display();
+      }
+      if (anyButPushed) break;
+    }
+    ForwardX = false; BackwardX = false; ForwardY = false; BackwardY = false;
+    lcd.display();
+  }
+}
+
+
+void backLight_changing(int val, int val_min, int val_max, int mode) {
+  static boolean val_min_activated = true, val_max_activated = true;
+  static unsigned int green, red, blue;
+  if (mode == 0) {
+    blue = 0;
+    if (val < val_min && !val_min_activated) {
+      val_min_activated = true;    red = 0; green = 255;
+      Driver.begin();    Driver.SetColor(red, green, blue);    Driver.end();
+    }
+    else if (val > val_max && !val_max_activated) {
+      val_max_activated = true;    red = 255; green = 0;
+      Driver.begin();    Driver.SetColor(red, green, blue);    Driver.end();
+    }
+    else if (val > val_min && val < val_max)  {
+      val_min_activated = false;  val_max_activated = false;
+      red = map(val, val_min, val_max, 0, 255);    green = 255 - red;
+      Driver.begin();    Driver.SetColor(red, green, blue);    Driver.end();
+    }
+  }
+  else if (mode == 1) {
+    red = 0;
+    if (val < val_min && !val_min_activated) {
+      val_min_activated = true;    blue = 255; green = 0;
+      Driver.begin();    Driver.SetColor(red, green, blue);    Driver.end();
+    }
+    else if (val > val_max && !val_max_activated) {
+      val_max_activated = true;    blue = 0; green = 255;
+      Driver.begin();    Driver.SetColor(red, green, blue);    Driver.end();
+    }
+    else if (val > val_min && val < val_max)  {
+      val_min_activated = false;  val_max_activated = false;
+      green = map(val, val_min, val_max, 0, 255);    blue = 255 - green;
+      Driver.begin();    Driver.SetColor(red, green, blue);    Driver.end();
+    }
+  }
+}
+
+
+
+void rgb_modes() {
+  if (rgb_mode == 0) return;
+  switch (rgb_mode) {
+    case 1: {
+        if (millis() - rgb_mode_millis > 300) {
+          rgb_mode_millis = millis();
+          backlight_colour++;
+          if (backlight_colour > 6) backlight_colour = 0;
+          backLight_set();
+        }
+        break;
+      }
+    case 2: {
+        rgb_mode_brightness--;
+        if (rgb_mode_brightness <= 0) rgb_mode_brightness = 255;
+        Driver.begin();
+        Driver.SetColor(0, rgb_mode_brightness, 0);
+        Driver.end();
+        break;
+      }
+  }
+}
+
+
+void multi_joystick()
+{
+  if (JoyBUT) {
+    JoyBUT = false;
+    multiJoy = !multiJoy;
+    lcd.clear();
+    lcd.setCursor(1, 0);
+    lcd.print("MULTIJOYSTICK");
+    lcd.setCursor(4, 1);
+    if (multiJoy) lcd.print("Enabled!");
+    else lcd.print("Disabled!");
+    delay(200);    delayAnyButPushed(1000);
+  }
+
+  if (!multiJoy) return;
+  if (BackwardY) {
+    lcd.clear();
+    if (digitalRead(Fog_out)) {
+      digitalWrite(Fog_out, LOW);
+      lcd.setCursor(2, 0);      lcd.print("Fog lights");
+      lcd.setCursor(4, 1);      lcd.print("Disabled");
+    }
+    else {
+      digitalWrite(Fog_out, HIGH);
+      lcd.setCursor(3, 0);      lcd.print("Fog lights");
+      lcd.setCursor(4, 1);      lcd.print("Enabled");
+    }
+    delay(200);    delayAnyButPushed(1000);
+  }
+  if (ForwardY) {
+    lcd.clear();
+    if (digitalRead(Head_out)) {
+      digitalWrite(Head_out, LOW);
+      lcd.setCursor(2, 0);      lcd.print("Head lights");
+      lcd.setCursor(4, 1);      lcd.print("Disabled");
+    }
+    else {
+      digitalWrite(Head_out, HIGH);
+      lcd.clear();
+      lcd.setCursor(2, 0);      lcd.print("Head lights");
+      lcd.setCursor(4, 1);      lcd.print("Enabled");
+    }
+    delay(200);    delayAnyButPushed(1000);
+  }
+  if (ForwardX) {
+    lcd.clear();
+    if (digitalRead(Plight_out)) {
+      digitalWrite(Plight_out, LOW);
+      lcd.setCursor(2, 0);      lcd.print("Park lights");
+      lcd.setCursor(4, 1);      lcd.print("Disabled");
+    }
+    else {
+      digitalWrite(Plight_out, HIGH);
+      lcd.setCursor(2, 0);      lcd.print("Park lights");
+      lcd.setCursor(4, 1);      lcd.print("Enabled");
+    }
+    delay(200);    delayAnyButPushed(1000);
+  }
+  if (BackwardX) {
+    lcd.clear();    lcd.print("Start/Stop: ");
+    start_stop_enabled = !start_stop_enabled;
+    if (start_stop_enabled) lcd.print("ON");
+    else lcd.print("OFF");
+    delay(200);    delayAnyButPushed(1000);
+  }
+}
+
+
+void booster()
+{
+  if (!Booster_function) return;
+  if (thr_pos > 95.0 && rpm > rpm_boost_set && !Boost && gear > 1) {
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("BOOST INITIALIZE");
+    delay(200);
+    for (int secs = 0; secs <= 80; secs++) {
+      show_scale(secs, 0, 80, 16);
+      delay(4);
+      if (thr_pos < 90.0) break;
+      if (secs == 80) {
+        Boost = true;
+        tx.wait = boost_set;
+        while (!rx.received && thr_pos > 95.0) {
+          ETout.sendData();          ETin.receiveData();
+        }
+        if (rx.received) {
+          rx.received = false;
+          lcd.clear();
+          lcd.setCursor(0, 0);         lcd.print("BOOSTER ENABLED!");
+          lcd.setCursor(0, 1);         lcd.print("Timing: +");
+          lcd.print(tx.wait);          lcd.print(" us");
+          buzzer(5);
+          for (int i = 0; i < 3; i++) {
+            Driver.begin();      Driver.SetColor(255, 255, 255);      Driver.end();
+            delay(150); lcd.noDisplay();  if (thr_pos < 90.0) break;
+            Driver.begin();      Driver.SetColor(0, 255, 0);      Driver.end();
+            delay(150); lcd.display();  if (thr_pos < 90.0) break;
+          }
+          lcd.display();
+          Driver.begin();      Driver.SetColor(0, 255, 0);      Driver.end();
+        }
+        else {
+          lcd.clear();
+          lcd.setCursor(1, 0);          lcd.print("Booster ERROR!");
+          lcd.setCursor(0, 1);          lcd.print("Timing: ");
+          lcd.print(tx.wait);           lcd.print(" us");
+          Boost = false;
+        }
+        int delay_booster_show = millis() + 1200;
+        while (millis() < delay_booster_show) {
+          if (thr_pos < 90.0) break;
+        }
+      }
+    }
+  }
+  if (thr_pos < 80.0 && Boost) {
+    tx.wait = 0;
+    ETout.sendData();
+    Boost = false;
+    lcd.clear();
+    lcd.setCursor(0, 0);    lcd.print("Booster disabled");
+    lcd.setCursor(0, 1);    lcd.print("Timing: +");
+    lcd.print(tx.wait);     lcd.print(" us");
+    buzzer(6);
+    while (!rx.received && thr_pos < 80.0) {
+      ETout.sendData();      ETin.receiveData();
+    }
+    if (rx.received) rx.received = false;
+    else {
+      lcd.clear();
+      lcd.setCursor(1, 0);      lcd.print("Booster ERROR!");
+      lcd.setCursor(0, 1);      lcd.print("Timing: +");
+      lcd.print(boost_set);      lcd.print(" us");
+      Boost = false;
+    }
+    delayAnyButPushed(1200);
+  }
+}
+
+void Anti_Lag() {
+  if (!anti_lag)  return;
+  static boolean antiLag = false;
+  if (!antiLag && rpm > 4000 && thr_pos < 40) {
+    antiLag = true;    tx.antiLag = true;
+    while (!rx.received && !anyButPushed()) {
+      ETout.sendData();          ETin.receiveData();
+    }
+    rx.received = false;
+    if (rx.received) {
+      lcd.clear();  lcd.setCursor(5, 0); lcd.print("ANTILAG");
+      lcd.setCursor(1, 1); lcd.print("Switched ON");
+    }
+    else {
+      lcd.clear();  lcd.setCursor(5, 0); lcd.print("ANTILAG");
+      lcd.setCursor(5, 1); lcd.print("ERROR");
+    }
+    while (antiLag)  {
+      if (rpm < 2500 || anyButPushed() || thr_pos > 40) {
+        antiLag = false;    tx.antiLag = false;
+        while (!rx.received && !anyButPushed()) {
+          ETout.sendData();          ETin.receiveData();
+        }
+        rx.received = false;
+        if (rx.received) {
+          lcd.setCursor(1, 1); lcd.print("Switched OFF");
+          delay(1000);
+        }
+        else {
+          lcd.clear();  lcd.setCursor(5, 0); lcd.print("ANTILAG");
+          lcd.setCursor(5, 1); lcd.print("ERROR");
+        }
+      }
+    }
+  }
+}
+
+void ride_fast_alarm(int ride_fast_temp)
+{
+  if (!ride_fast) return;
+  if (ACTUAL_TIME_WORKING > 60 && temp_cool >= ride_fast_temp) {
+    if (NPage == 1 && NPage1 == 1 && NPage2 == 8) {
+      NPage = 1; NPage1 = 1; NPage2 = 1;
+    }
+    ride_fast = false;  temp_cool_lighting = false;
+    knob_light_off();
+    lcd.clear();
+    lcd.setCursor(1, 0); lcd.print("Engine temp OK");
+    lcd.setCursor(3, 1); lcd.print("DAJ PIZDY!");
+    for (int i = 0; i < 8; i++) {
+      delay(300); lcd.noDisplay();
+      if (thr_pos > 40) break; buzzer(9); digitalWrite(knob_red, HIGH);
+      delay(200); lcd.display();
+      if (thr_pos > 40) break; buzzer(10); digitalWrite(knob_red, HIGH);
+    }
+    knob_light_off();
+    lcd.display();
+  }
+  else if (rpm > 3500 || thr_pos > 50) {
+    knob_light_off();
+    lcd.clear();
+    lcd.setCursor(2, 0); lcd.print("Engine temp");
+    lcd.setCursor(1, 1); lcd.print("IS TOO COLD!!!");
+    for (int i = 0; i < 10; i++) {
+      delay(300); lcd.noDisplay();
+      Driver.begin();      Driver.SetColor(0, 255, 0);      Driver.end();
+      if (thr_pos < 10 || rpm < 3500) break;
+      buzzer(10); digitalWrite(knob_red, HIGH);
+      delay(150); lcd.display();
+      Driver.begin();    Driver.SetColor(255, 0, 0);    Driver.end();
+      if (thr_pos < 10 || rpm < 3500) break;
+      buzzer(9); digitalWrite(knob_red, HIGH);
+    }
+    Driver.begin();    Driver.SetColor(0, 255, 0);    Driver.end();
+    knob_light_off();    lcd.display();
+  }
+}
+
+void GSM_Signal() {
+  static unsigned long last_GSM_signal_millis = 0;
+  if (millis() - last_GSM_signal_millis > 3000)  {
+    last_GSM_signal_millis = millis();    buzzer(11);
+  }
+}
+
+void buzzer(int mel) {
+  switch (mel) {
+    case 1: //Engine started
+      {
+        tone(Buz_out, 1000); delay(100); noTone(Buz_out);
+        tone(Buz_out, 2000); delay(100); noTone(Buz_out);
+        tone(Buz_out, 3000); delay(100); noTone(Buz_out);
+        tone(Buz_out, 3500); delay(200); noTone(Buz_out);
+        break;
+      }
+    case 2: // Engine stopped
+      {
+        tone(Buz_out, 3000); delay(100); noTone(Buz_out);
+        tone(Buz_out, 2000); delay(100); noTone(Buz_out);
+        tone(Buz_out, 1000); delay(100); noTone(Buz_out);
+        tone(Buz_out, 500); delay(200); noTone(Buz_out);
+        break;
+      }
+    case 3: // Light changing
+      {
+        tone(Buz_out, 3500, 80);
+        break;
+      }
+    case 4: // Any button buzzer
+      {
+        tone(Buz_out, 2000, 20);
+        break;
+      }
+    case 5: // Booster enabled
+      {
+        tone(Buz_out, 1500); delay(100); noTone(Buz_out);
+        tone(Buz_out, 4000); delay(200); noTone(Buz_out);
+        break;
+      }
+    case 6: // Booster disabled
+      {
+        tone(Buz_out, 4000); delay(100); noTone(Buz_out);
+        tone(Buz_out, 1500); delay(200); noTone(Buz_out);
+        break;
+      }
+    case 7: // Voltage alarm
+      {
+        tone(Buz_out, 4000, 300);
+        break;
+      }
+    case 8: // Speed alarm
+      {
+        tone(Buz_out, 3500, 150);
+        delay(200);
+        tone(Buz_out, 3500, 150);
+        break;
+      }
+    case 9: // RPM alarm
+      {
+        tone(Buz_out, 4500, 100);
+        break;
+      }
+    case 10: // Ride fast alarm
+      {
+        tone(Buz_out, 3500, 50);
+        break;
+      }
+    case 11: // GSM Signal alarm
+      {
+        tone(Buz_out, 1000, 100);
+        delay(150);
+        tone(Buz_out, 1000, 100);
+        break;
+      }
+  }
+}
+
+// —--------------------------------подпрограммы бортовика--------------------------------—
+
+void obd1()
+{
+  if (!display_update_data) return;
+  display_update_data_counter = 0;  display_update_data = false;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  switch (NPage) {
+    case
+        1: //------------------------------------------Actual data----------------------------------—
+      {
+        if (NPage_show) {
+          lcd.setCursor(3, 0);
+          lcd.print("HONDA MENU");
+          lcd.setCursor(0, 1);
+          lcd.print("1.System Data");
+          NPage_switcher();
+        }
+        else {
+          lcd.setCursor(0, 1);
+          switch (NPage1) {
+            case 1:
+              {
+                if (NPage1_show) lcd.print("1.Actual Data");
+                else {
+                  lcd.setCursor(0, 0);
+                  switch (NPage2) {
+                    case 1:
+                      {
+                        if (vss > 2) {
+                          lcd.print("L/km");
+                          lcd.setCursor(0, 1);  lcd.print(fuelc, 1);
+                        }
+                        else {
+                          lcd.print("L/h");
+                          lcd.setCursor(0, 1);  lcd.print(fuelsc, 1);
+                        }
+                        lcd.setCursor(5, 0);  lcd.print("l/100");
+                        lcd.setCursor(6, 1);  lcd.print(fuelmed_short, 1);
+                        lcd.setCursor(12, 0); lcd.print("Left");
+                        lcd.setCursor(13, 1); lcd.print(dist_left, 0);
+                        counter_reset();
+                        break;
+                      }
+                    case 2:
+                      {
+                        lcd.print("0"); lcd.setCursor(7, 0);  lcd.print("15");
+                        show_scale(fuelc, 0, 30, 14);
+                        break;
+                      }
+                    case 3:
+                      {
+                        lcd.print("Dist&fuel short");
+                        lcd.setCursor(0, 1);  lcd.print(dist_short);
+                        lcd.setCursor(11, 1); lcd.print(fuel_short);
+                        counter_reset();
+                        break;
+                      }
+                    case 4:
+                      {
+                        lcd.print("Dist&fuel all");
+                        lcd.setCursor(0, 1); lcd.print(distance);
+                        lcd.setCursor(11, 1); lcd.print(fuel_tank);
+                        counter_reset();
+                        break;
+                      }
+                    case 5:
+                      {
+                        lcd.print("Medium");
+                        lcd.setCursor(0, 1);    lcd.print(fuelmed);
+                        lcd.setCursor(12, 0);   lcd.setCursor(12, 0);
+                        lcd.print("FuelLeft");  lcd.setCursor(11, 1);
+                        lcd.print(fuel_left);
+                        counter_reset();
+                        break;
+                      }
+                    case 6:
+                      {
+                        lcd.print("Mid Speed");
+                        lcd.setCursor(0, 1);  lcd.print(middle_speed, 0);
+                        lcd.print("Km/h");
+                        break;
+                      }
+                    case 7:
+                      {
+                        lcd.print("Fuel");
+                        lcd.setCursor(11, 0);   lcd.print("Price");
+                        lcd.setCursor(0, 1);    lcd.print(fuel_money);
+                        if (dist_money >= 10.0)  lcd.setCursor(11, 1);
+                        else if (dist_money >= 100.0)  lcd.setCursor(10, 1);
+                        else  lcd.setCursor(12, 1);
+                        lcd.print(dist_money);
+                        counter_reset();
+                        break;
+                      }
+                    case 8:
+                      {
+                        lcd.print("TempCool");
+                        lcd.setCursor(13, 0); lcd.print("Air");
+                        lcd.setCursor(3, 1);  lcd.write((byte)6);
+                        lcd.setCursor(0, 1);  lcd.print(temp_cool, 1);
+                        lcd.setCursor(13, 1); lcd.print(temp_air, 1);
+                        break;
+                      }
+                  }
+                  NPage2_switcher(8);
+                }
+                break;
+              }
+            case 2:
+              {
+                if (NPage1_show) lcd.print("2.ECU Data");
+                else {
+                  lcd.setCursor(0, 0);
+                  switch (NPage2) {
+                    case 1:
+                      { lcd.print("RPM:");
+                        lcd.setCursor(4, 0);  lcd.print(rpm);
+                        lcd.setCursor(0, 1);  lcd.print("VSS:");
+                        lcd.setCursor(4, 1);  lcd.print(vss);
+                        lcd.setCursor(12, 0); lcd.print("Gear");
+                        lcd.setCursor(14, 1); lcd.print(gear);
+                        break;
+                      }
+                    case 2:
+                      {
+                        lcd.print("Ign:");
+                        lcd.setCursor(4, 0);  lcd.print(ign);
+                        lcd.setCursor(9, 0);  lcd.print("TPS:");
+                        lcd.setCursor(13, 0); lcd.print(thr_pos);
+                        lcd.print("%");
+                        show_scale(rpm, 0, 7000, 16);
+                        break;
+                      }
+                    case 3:
+                      {
+                        lcd.print("Inj:");
+                        lcd.setCursor(4, 0);  lcd.print(time_inj, 0);
+                        lcd.setCursor(9, 0);  lcd.print("Ign:");
+                        lcd.setCursor(13, 0); lcd.print(ign);
+                        show_scale(time_inj, 0, 30, 16);
+                        break;
+                      }
+                    case 4:
+                      {
+                        lcd.print("MAP");
+                        lcd.setCursor(12, 0); lcd.print("Baro");
+                        lcd.setCursor(0, 1);  lcd.print(abs_pres, 2);
+                        lcd.setCursor(11, 1); lcd.print(atm_pres, 2);
+                        break;
+                      }
+                    case 5:
+                      {
+                        lcd.write((byte)7);
+                        lcd.setCursor(1, 0);  lcd.print("-Zond");
+                        lcd.setCursor(12, 0); lcd.print("Idle");
+                        lcd.setCursor(0, 1);  lcd.print(volt_lz1, 2);
+                        lcd.print("V");
+                        lcd.setCursor(13, 1); lcd.print(valv_idle, 0);
+                        lcd.print("%");
+                        break;
+                      }
+                    case 6:
+                      {
+                        lcd.print("Volt");
+                        lcd.setCursor(12, 0); lcd.print("Load");
+                        lcd.setCursor(0, 1);  lcd.print(volt_net, 2);
+                        lcd.print("V");
+                        lcd.setCursor(13, 1); lcd.print(load_gen, 0);
+                        lcd.print("%");
+                        break;
+                      }
+                    case 7:
+                      {
+                        lcd.print("TempCool");
+                        lcd.setCursor(13, 0); lcd.print("Air");
+                        lcd.setCursor(3, 1);  lcd.write((byte)6);
+                        lcd.setCursor(0, 1);  lcd.print(temp_cool, 1);
+                        lcd.setCursor(13, 1); lcd.print(temp_air, 1);
+                        break;
+                      }
+                    case 8:
+                      {
+                        lcd.print("ST corr");
+                        lcd.setCursor(9, 0);    lcd.print("LT corr");
+                        lcd.setCursor(0, 1);    lcd.write(st_corr);
+                        lcd.setCursor(12, 1);    lcd.print(lt_corr);
+                        break;
+                      }
+                    case 9:
+                      {
+                        lcd.print("EGR Valve pos.");
+                        lcd.setCursor(0, 1);    lcd.print(pos_egr);
+                        break;
+                      }
+                    case 10:
+                      {
+                        lcd.print("Dis08"); lcd.setCursor(11, 0);  lcd.print("Dis09");
+                        lcd.setCursor(1, 1);    lcd.print(dis08);
+                        lcd.setCursor(13, 1);    lcd.print(dis09);
+                        break;
+                      }
+                    case 11:
+                      {
+                        lcd.print("Dis0A"); lcd.setCursor(11, 0);  lcd.print("Dis0B");
+                        lcd.setCursor(1, 1);    lcd.print(dis0A);
+                        lcd.setCursor(13, 1);    lcd.print(dis0B);
+                        break;
+                      }
+                    case 12:
+                      {
+                        lcd.print("Dis0C"); lcd.setCursor(11, 0);  lcd.print("Dis0D");
+                        lcd.setCursor(1, 1);    lcd.print(dis0C);
+                        lcd.setCursor(13, 1);    lcd.print(dis0D);
+                        break;
+                      }
+                    case 13:
+                      {
+                        lcd.print("Dis0E"); lcd.setCursor(11, 0);  lcd.print("Dis0F");
+                        lcd.setCursor(1, 1);    lcd.print(dis0E);
+                        lcd.setCursor(13, 1);    lcd.print(dis0F);
+                        break;
+                      }
+                  }
+                  NPage2_switcher(12);
+                }
+                break;
+              }
+
+            case 3:
+              {
+                if (NPage1_show) lcd.print("3.Arduino Data");
+                else {
+                  lcd.setCursor(0, 0);
+                  switch (NPage2) {
+                    case 1:
+                      {
+                        int brightness_print = analogRead(fotoPin) / 10;
+                        constrain(brightness_print, 0, 100);
+                        lcd.print("Brightness: ");
+                        lcd.print(brightness_print);
+                        lcd.print("%");
+                        lcd.setCursor(2, 1);
+                        if (digitalRead(Head_out) && !digitalRead(Fog_out)) lcd.print("*Headlights*");
+                        else if (!digitalRead(Head_out) && digitalRead(Fog_out)) lcd.print("*Foglights*");
+                        else if (digitalRead(Head_out) && digitalRead(Fog_out)) lcd.print("*Bouth*");
+                        else if (!digitalRead(Head_out) && !digitalRead(Fog_out)) lcd.print("*Lights OFF*");
+                        else lcd.print("*Read pin error*");
+                        break;
+                      }
+                    case 2:
+                      {
+                        lcd.setCursor(0, 0);
+                        lcd.print("Iteration Time");
+                        lcd.setCursor(0, 1);
+                        lcd.print(iteration_print);
+                        lcd.print("ms");
+                        break;
+                      }
+                    case 3:
+                      {
+                        lcd.setCursor(0, 0);
+                        lcd.print("Data read errors");
+                        lcd.setCursor(0, 1);
+                        lcd.print("Count: ");
+                        lcd.print(read_data_errors);
+                        break;
+                      }
+                    case 4:
+                      {
+                        lcd.setCursor(0, 0);
+                        lcd.print("Sta/Stop counter");
+                        lcd.setCursor(0, 1);
+                        lcd.print("Count: ");
+                        lcd.print(start_stop_counter);
+                        break;
+                      }
+                    case 5:
+                      {
+                        lcd.setCursor(0, 0);
+                        lcd.print("Vss counter");
+                        lcd.setCursor(0, 1);
+                        lcd.print("Count: ");
+                        lcd.print(start_stop_vss_counter);
+                        break;
+                      }
+                    case 6:
+                      {
+                        lcd.setCursor(0, 0);
+                        lcd.print("Joystick values");
+                        lcd.setCursor(0, 1); lcd.print("X: ");
+                        lcd.print(analogRead(joystickX));
+                        lcd.setCursor(8, 1); lcd.print("Y: ");
+                        lcd.print(analogRead(joystickY));
+                        break;
+                      }
+                  }
+                  NPage2_switcher(6);
+                }
+                break;
+              }
+            case 4:
+              {
+                if (NPage1_show) lcd.print("4.Honda Data");
+                else {
+                  lcd.setCursor(0, 0);
+                  switch (NPage2) {
+                    case 1:
+                      {
+                        lcd.setCursor(0, 0);
+                        lcd.print("Engine working");
+                        lcd.setCursor(0, 1);
+                        int hours = real_time(ACTUAL_TIME_WORKING, 1);
+                        if (hours < 10) lcd.print("0");
+                        lcd.print(hours);
+                        lcd.print(":");
+                        int minutes = real_time(ACTUAL_TIME_WORKING, 2);
+                        if (minutes < 10) lcd.print("0");
+                        lcd.print(minutes);
+                        lcd.print(":");
+                        int seconds = real_time(ACTUAL_TIME_WORKING, 3);
+                        if (seconds < 10) lcd.print("0");
+                        lcd.print(seconds);
+                        break;
+                      }
+                    case 2:
+                      {
+                        lcd.setCursor(2, 0);
+                        lcd.print("Main Distance");
+                        lcd.setCursor(0, 1);
+                        lcd.print(main_distance);
+                        lcd.print(" km");
+                        break;
+                      }
+                    case 3:
+                      {
+                        lcd.print("Next oil change");
+                        lcd.setCursor(0, 1);
+                        int oil_change = ENGINE_NEXT_OIL_SERVICE - main_distance;
+                        lcd.print(oil_change);
+                        lcd.print(" KM");
+                        break;
+                      }
+                    case 4:
+                      {
+                        lcd.print("Clean air filter");
+                        lcd.setCursor(0, 1);
+                        int air_filter_change = ENGINE_AIR_FILTER_SERVICE - main_distance;
+                        lcd.print(air_filter_change);
+                        lcd.print(" KM");
+                        break;
+                      }
+                  }
+                  NPage2_switcher(4);
+                }
+                break;
+              }
+              break;
+          }
+          if (NPage1_show) {
+            lcd.setCursor(3, 0);
+            lcd.print("System Data");
+            NPage1_switcher(4);
+          }
+        }
+        break;
+      }
+
+    case 2: //------------------------------------------Applications----------------------------------—
+      {
+        if (NPage_show) {
+          lcd.setCursor(3, 0);
+          lcd.print("HONDA MENU");
+          lcd.setCursor(0, 1);
+          lcd.print("2.Control Unit");
+          NPage_switcher();
+        }
+        else {
+          lcd.setCursor(0, 1);
+          switch (NPage1)
+          {
+            case 1:
+              {
+                if (NPage1_show) lcd.print("1.Light Mode");
+                else {
+                  lcd.setCursor(0, 0);
+                  light_switch();
+                  NPage2_switcher(3);
+                }
+                break;
+              }
+            case 2:
+              {
+                if (NPage1_show) lcd.print("2.Relay Switcher");
+                else {
+                  lcd.setCursor(0, 0);
+                  relay_switch();
+                  NPage2_switcher(5);
+                  break;
+                }
+                break;
+              }
+          }
+          if (NPage1_show) {
+            lcd.setCursor(3, 0);
+            lcd.print("Control Unit");
+            NPage1_switcher(2);
+          }
+        }
+        break;
+      }
+
+
+    case 3: //------------------------------------------Applications----------------------------------—
+      {
+        if (NPage_show == true) {
+          lcd.setCursor(3, 0);
+          lcd.print("HONDA MENU");
+          lcd.setCursor(0, 1);
+          lcd.print("3.Applications");
+          NPage_switcher();
+        }
+        else {
+          switch (NPage1) {
+            case 1:
+              {
+                if (NPage1_show) {
+                  lcd.print(" Applications");     lcd.setCursor(0, 1);
+                }
+                lcd.print("RGB Controller");
+                if (!NPage1_show) {
+                  lcd.setCursor(0, 1);
+                  if (rgb_mode == 0) lcd.print(" No mode");
+                  else {
+                    lcd.print("Mode: ");    lcd.print(rgb_mode);
+                  }
+                  rgb_mode = universal_set(rgb_mode, 1, 0, 4);
+                }
+                break;
+              }
+            case 2:
+              {
+                secs_till_100(vss);
+                break;
+              }
+            case 3:
+              {
+                balance_check();
+                break;
+              }
+          }
+          NPage1_switcher(3);
+        }
+        break;
+      }
+
+    case 4: //------------------------------------------Options----------------------------------—
+      {
+        if (NPage_show == true) {
+          lcd.setCursor(3, 0);
+          lcd.print("HONDA MENU");
+          lcd.setCursor(0, 1);
+          lcd.print("4.Optinons");
+          NPage_switcher();
+        }
+        else {
+          if (NPage1_show) {
+            lcd.setCursor(4, 0);
+            lcd.print("OPTIONS");
+            lcd.setCursor(0, 1);
+          }
+          switch (NPage1) {
+            case 1:
+              {
+                lcd.print("Booster: ");
+                if (BackwardY) {
+                  Booster_function = !Booster_function;
+                }
+                if (Booster_function) lcd.print("ON");
+                else lcd.print("OFF");
+                break;
+              }
+            case 2:
+              {
+                lcd.print("Start/Stop: ");
+                if (BackwardY) {
+                  start_stop_enabled = !start_stop_enabled;
+                }
+                if (start_stop_enabled) lcd.print("ON");
+                else lcd.print("OFF");
+                break;
+              }
+            case 3:
+              {
+                lcd.print("BackLight colour");
+                if (BackwardY) {
+                  backlight_colour++;
+                  backLight_set();
+                }
+                break;
+              }
+            case 4:
+              {
+                lcd.print(" B/L Brightness");
+                if (!NPage1_show) {
+                  lcd.setCursor(0, 1); lcd.print("Value: ");
+                  lcd.print(backlight_brightness);
+                  backlight_brightness = universal_set(backlight_brightness, 15, 0, 255);
+                  backLight_set();
+                }
+                break;
+              }
+            case 5:
+              {
+                if (NPage1_show) lcd.print("Booster millis");
+                else {
+                  lcd.setCursor(1, 0);  lcd.print("Booster millis");
+                  lcd.setCursor(0, 1); lcd.print("Delay: ");
+                  lcd.print(boost_set); lcd.print(" us");
+                  boost_set = universal_set(boost_set, 200, 0, 10000);
+                }
+                break;
+              }
+            case 6:
+              {
+                if (NPage1_show) lcd.print("Booster RPM min");
+                else {
+                  lcd.print("Booster RPM min");
+                  lcd.setCursor(0, 1); lcd.print("RPM: ");
+                  lcd.print(rpm_boost_set);
+                  rpm_boost_set = universal_set(rpm_boost_set, 200, 600, 7000);
+                }
+                break;
+              }
+            case 7:
+              {
+                if (NPage1_show) lcd.print("Read data delay");
+                else {
+                  lcd.setCursor(1, 0);  lcd.print("Read data delay");
+                  lcd.setCursor(0, 1); lcd.print("Delay: ");
+                  lcd.print(read_data_millis); lcd.print(" ms");
+                  read_data_millis = universal_set(read_data_millis, 1, 10, 50);
+                }
+                break;
+              }
+
+            case 8:
+              {
+                if (NPage1_show) lcd.print("Head light delay");
+                else {
+                  lcd.print("Head light delay");
+                  lcd.setCursor(0, 1); lcd.print("Delay: ");
+                  lcd.print(light_delay_set); lcd.print(" ms");
+                  light_delay_set = universal_set(light_delay_set, 200, 0, 20000);
+                }
+                break;
+              }
+            case 9:
+              {
+                if (NPage1_show) lcd.print("Button delay");
+                else {
+                  lcd.setCursor(2, 0);  lcd.print("Button delay");
+                  lcd.setCursor(0, 1); lcd.print("Delay: ");
+                  lcd.print(button_delay); lcd.print(" ms");
+                  button_delay = universal_set(button_delay, 50, 0, 5000);
+                }
+                break;
+              }
+            case 10:
+              {
+                if (NPage1_show) lcd.print("Errors counter");
+                else {
+                  lcd.setCursor(1, 0);  lcd.print("Max data errors");
+                  lcd.setCursor(0, 1); lcd.print("Count: ");
+                  lcd.print(read_data_errors_max);
+                  read_data_errors_max = universal_set(read_data_errors_max, 1, 1, 100);
+                }
+                break;
+              }
+            case 11:
+              {
+                if (NPage1_show) lcd.print("Main Distance");
+                else {
+                  lcd.print("Correct distance");
+                  lcd.setCursor(0, 1); lcd.print("Set: ");
+                  lcd.print(main_distance); lcd.print(" km");
+                  main_distance = universal_set(main_distance, 1, 0, 5000000);
+                }
+                break;
+              }
+            case 12:
+              {
+                lcd.print("Autolight: ");
+                if (BackwardY) {
+                  light_function = !light_function;
+                }
+                if (light_function) lcd.print("ON");
+                else lcd.print("OFF");
+                break;
+              }
+            case 13:
+              {
+                if (NPage1_show) lcd.print("Distance price");
+                else {
+                  lcd.print("Correct price");
+                  lcd.setCursor(0, 1); lcd.print("Set: ");
+                  lcd.print(dist_price); lcd.print(" Kc");
+                  dist_price = universal_set(dist_price, 1, 1, 50);
+                }
+                break;
+              }
+            case 14:
+              {
+                if (NPage1_show) lcd.print("Fuel price");
+                else {
+                  lcd.print("Correct price");
+                  lcd.setCursor(0, 1); lcd.print("Set: ");
+                  lcd.print(fuel_price); lcd.print(" Kc");
+                  float fuel_price_corr = fuel_price * 10;
+                  fuel_price_corr = universal_set(fuel_price_corr, 1, 200, 500);
+                  fuel_price = fuel_price_corr / 10;
+                }
+                break;
+              }
+            case 15:
+              {
+                lcd.print("LightChange: ");
+                if (BackwardY)   light_changing = !light_changing;
+                if (light_changing) lcd.print("ON");
+                else lcd.print("OFF");
+                break;
+              }
+            case 16:
+              {
+                lcd.print("Antilag: ");
+                if (BackwardY) {
+                  anti_lag = !anti_lag;
+                }
+                if (anti_lag) lcd.print("ON");
+                else lcd.print("OFF");
+                break;
+              }
+          }
+          if (NPage1_show) NPage1_switcher(16);
+        }
+        break;
+      }
+  }
+}
+
+
+void balance_check() {
+  lcd.setCursor(2, 0);  lcd.print("SIM Balance");
+  lcd.setCursor(0, 1);  lcd.print("Last:");
+  lcd.setCursor(6, 1);  lcd.print(last_cash);
+  if (BackwardY) {
+    while (analogRead(joystickY) < 50) {}
+    BackwardY = false;
+    Serial.println("Checking...");
+    lcd.setCursor(0, 1);  lcd.print("Cheking...");
+    Serial2.println("Balance");
+    delay(400);
+    int point_animation = 0;
+    unsigned long point_animation_millis = 0;
+    while (!Serial2.available()) {
+      if (millis() - point_animation_millis >= 333)  {
+        point_animation_millis = millis();
+        point_animation++;
+        lcd.clear();
+        lcd.setCursor(2, 0);  lcd.print("SIM Balance");
+        lcd.setCursor(0, 1);  lcd.print("Cheking");
+        if (point_animation <= 3)   lcd.print(".");
+        else point_animation = 0;
+        Serial.println(point_animation);
+      }
+      if (analogRead(joystickY) < 50) break;
+    }
+    gsm_arduino_rx();
+    Serial.println("RECEIVED!");
+    int cash = atoi(currStr.c_str());
+    last_cash = cash;
+    Serial.println(currStr);
+    Serial.println(last_cash);
+  }
+}
+
+
+
+void NPage_switcher()
+{
+  if (multiJoy) return;
+  if (ForwardX) {
+    ForwardX = false;
+    NPage++;
+    if (NPage > 4) NPage = 1;
+  }
+  else if (BackwardX) {
+    BackwardX = false;
+    NPage--;
+    if (NPage < 1) NPage = 4;
+  }
+  if (BackwardY) {
+    BackwardY = false;
+    NPage_show = false;
+    NPage1_show = true;
+    NPage1 = 1;
+  }
+}
+
+void NPage1_switcher(int NPage1_max)
+{
+  if (multiJoy) return;
+  if (ForwardX) {
+    ForwardX = false;
+    NPage1++;
+    if (NPage1 > NPage1_max) NPage1 = 1;
+  }
+  else if (BackwardX) {
+    BackwardX = false;
+    NPage1--;
+    if (NPage1 < 1) NPage1 = NPage1_max;
+  }
+  if (ForwardY) {
+    ForwardY = false;
+    NPage_show = true;
+    NPage1_show = false;
+  }
+  else if (BackwardY) {
+    if (NPage == 4) {
+      if (NPage1 == 1 || NPage1 == 2 || NPage1 == 3 || NPage1 == 12 || NPage1 == 15 || NPage1 == 16) return;
+    }
+    BackwardY = false;
+    NPage1_show = false;
+    NPage2 = 1;
+  }
+}
+
+void NPage2_switcher(int NPage2_max)
+{
+  if (multiJoy) return;
+  if (ForwardX) {
+    ForwardX = false;
+    NPage2++;
+    if (NPage2 > NPage2_max) NPage2 = 1;
+  }
+  else if (BackwardX) {
+    BackwardX = false;
+    NPage2--;
+    if (NPage2 < 1) NPage2 = NPage2_max;
+  }
+  if (ForwardY) {
+    ForwardY = false;
+    NPage1_show = true;
+  }
+}
+
+void counter_reset()
+{
+  if (multiJoy) return;
+  if (BackwardY) {
+    delay(500);
+    if (BackwardY_released) return;
+    BackwardY = false;
+    lcd.clear();    lcd.setCursor(2, 0);    lcd.print("RESET DATA?");
+    for (int secs = 0; secs <= 80; secs++) {
+      delay(14);
+      show_scale(secs, 0, 80, 16);
+      if (BackwardY_released) break;
+      if (secs == 80)
+      { dist_short = 0;
+        fuel_short = 0;
+        lcd.clear();     lcd.setCursor(2, 0);        lcd.print("Dist & fuel");
+        lcd.setCursor(4, 1);        lcd.print("RESETED");
+        delayAnyButPushed(1500);        delay(100);
+        if (analogRead(joystickY) < 50) {
+          lcd.clear();      lcd.setCursor(1, 0);      lcd.print("NEW FUEL TANK?");
+          delay(200);
+          if (analogRead(joystickY) > 50) return;
+          for (int secs = 0; secs <= 80; secs++) {
+            delay(18);
+            show_scale(secs, 0, 80, 16);
+            if (BackwardY_released) break;
+            if (secs == 80)
+            { lcd.setCursor(0, 1); lcd.print("RELEASE JOYSTICK");
+              while (analogRead(joystickY) < 100) {}
+              distance = 0; fuel_tank = 0;
+              lcd.clear();
+              while (!BackwardY) {
+                lcd.setCursor(1, 0);     lcd.print("Set fuel value");
+                lcd.setCursor(0, 1);    lcd.print("Added: ");
+                lcd.print(fuel_added); lcd.print(" Litrs");
+                fuel_added = universal_set(fuel_added, 1, 0, 65);
+              }
+              lcd.clear();
+              lcd.setCursor(1, 0); lcd.print("NEW TANK VALUE");
+              lcd.setCursor(5, 1); lcd.print("SETTED!");
+              delay(300);
+              delayAnyButPushed(2000);
+            }
+          }
+        }
+        if (!ecu_read_data)   calculate_data();
+      }
+    }
+  }
+}
+
+
+
+void secs_till_100(int var)
+{
+  if (BackwardY) {
+    while (analogRead(joystickY) < 50) {} BackwardY = false;
+    currMillis_secs_till_100 = millis();
+    prevMillis_secs_till_100 = millis();
+    time_result_secs_till_100 = 0;
+    show = false;
+  }
+  if (!show) {
+    if (var == 0) {
+      lcd.print("SECONDS TILL 100");
+      lcd.setCursor(2, 1);
+      lcd.print("Waiting start");
+      prevMillis_secs_till_100 = millis();
+    }
+    else if (100 > var > 0) {
+      lcd.print(var);
+      lcd.setCursor(3, 0);
+      lcd.print("Km/h");
+      show_scale(var, 0, 100, 13);
+    }
+    else if (var >= 100) {
+      currMillis_secs_till_100 = millis();
+      time_result_secs_till_100 = (currMillis_secs_till_100 - prevMillis_secs_till_100) / 1000.0;
+      show = true;
+    }
+  }
+  else {
+    lcd.clear();    lcd.print("Secs       Speed");
+    lcd.setCursor(0, 1);    lcd.print(time_result_secs_till_100);
+    lcd.setCursor(13, 1);    lcd.print(var);
+    if (var == 0) {
+      time_result_secs_till_100 = 0;
+      show = false;
+    }
+  }
+}
+void backLight_set() {
+  if (backlight_colour > 6) backlight_colour = 0;
+  Driver.begin();
+  switch (backlight_colour) {
+    case 0: Driver.SetColor(0, backlight_brightness, 0); //Green
+    case 1: Driver.SetColor(backlight_brightness, 0, 0); //Red
+    case 2: Driver.SetColor(0, 0, backlight_brightness); //Blue
+    case 3: Driver.SetColor(backlight_brightness, backlight_brightness, 0); //Yellow
+    case 4: Driver.SetColor(0, backlight_brightness, backlight_brightness); //Cyan
+    case 5: Driver.SetColor(backlight_brightness, 0, backlight_brightness); //Magenta
+    case 6: Driver.SetColor(backlight_brightness, backlight_brightness, backlight_brightness); //White
+  }
+  Driver.end();
+}
+
+
+
+void light_switch()
+{
+  lcd.print("LIGHT MODE:");
+  if (NPage2 > 1 && light_function) {
+    light_function = false;
+  }
+  else if (NPage2 == 1 && !light_function) {
+    light_function = true;
+    if (actual_mode == 3) {
+      digitalWrite(Head_out, Head_on);      digitalWrite(Fog_out, !Head_on);
+    }
+  }
+  switch (NPage2) {
+    case 1: //-------------------------Автоматический режим
+      {
+        lcd.setCursor(12, 0);        lcd.print("Auto");
+        lcd.setCursor(2, 1);
+        if (digitalRead(Head_out) && !digitalRead(Fog_out)) lcd.print("*Headlights*");
+        else if (!digitalRead(Head_out) && digitalRead(Fog_out)) lcd.print("*Foglights*");
+        else if (digitalRead(Head_out) && digitalRead(Head_out)) lcd.print("All lights");
+        else lcd.print("*No lights*");
+        break;
+      }
+    case 2: //-------------------------Управление ближним светом
+      {
+        lcd.setCursor(12, 0);        lcd.print("Manu");
+        if (BackwardY) {
+          while (analogRead(joystickY) < 50) {} BackwardY = false;
+          if (digitalRead(Head_out)) digitalWrite(Head_out, LOW);
+          else digitalWrite(Head_out, HIGH);
+        }
+        lcd.setCursor(0, 1);
+        if (digitalRead(Head_out)) lcd.print("-|HEAD|- ");
+        else lcd.print("-|head|- ");
+        if (digitalRead(Fog_out)) lcd.print("FOG");
+        else lcd.print("fog");
+        break;
+      }
+    case 3: //-------------------------Управление противотуманками
+      {
+        lcd.setCursor(12, 0);        lcd.print("Manu");
+        if (BackwardY) {
+          while (analogRead(joystickY) < 50) {} BackwardY = false;
+          if (digitalRead(Fog_out)) digitalWrite(Fog_out, LOW);
+          else digitalWrite(Fog_out, HIGH);
+        }
+        lcd.setCursor(0, 1);
+        if (digitalRead(Head_out)) lcd.print("  HEAD   ");
+        else lcd.print("  head   ");
+        if (digitalRead(Fog_out)) lcd.print("-|FOG|-");
+        else lcd.print("-|fog|-");
+        break;
+      }
+  }
+}
+
+
+void relay_switch()
+{
+  lcd.print("Relay Switcher");
+  lcd.setCursor(0, 1);
+
+  switch (NPage2) {
+    case 1:
+      {
+        if (BackwardY) {
+          while (analogRead(joystickY) < 50) {} BackwardY = false;
+          if (digitalRead(pwr_out)) digitalWrite(pwr_out, LOW);
+          else digitalWrite(pwr_out, HIGH);
+        }
+        lcd.print("ACC");
+        lcd.setCursor(13, 1);
+        if (digitalRead(pwr_out)) lcd.print("ON");
+        else lcd.print("OFF");
+        break;
+      }
+    case 2:
+      {
+        if (BackwardY) {
+          while (analogRead(joystickY) < 50) {} BackwardY = false;
+          if (digitalRead(ign1_out)) digitalWrite(ign1_out, LOW);
+          else digitalWrite(ign1_out, HIGH);
+        }
+        lcd.print("Ignition 1");
+        lcd.setCursor(13, 1);
+        if (digitalRead(ign1_out)) lcd.print("ON");
+        else lcd.print("OFF");
+        break;
+      }
+    case 3:
+      {
+        if (BackwardY) {
+          while (analogRead(joystickY) < 50) {} BackwardY = false;
+          if (digitalRead(ign2_out)) digitalWrite(ign2_out, LOW);
+          else digitalWrite(ign2_out, HIGH);
+        }
+        if (rpm > 500) {
+          digitalWrite(start_out, LOW);
+          actual_mode = 3;
+        }
+        lcd.print("Ignition 2");
+        lcd.setCursor(13, 1);
+        if (!ecu_read_data) ecu_read_data = true;
+        if (digitalRead(ign2_out)) lcd.print("ON");
+        else lcd.print("OFF");
+        break;
+      }
+    case 4:
+      {
+        if (BackwardY) {
+          while (analogRead(joystickY) < 50) {} BackwardY = false;
+          if (digitalRead(start_out)) digitalWrite(start_out, LOW);
+          else if (rpm < 500) digitalWrite(start_out, HIGH);
+        }
+        if (rpm > 500) {
+          digitalWrite(start_out, LOW);
+          actual_mode = 3;
+        }
+        lcd.print("Starter");
+        lcd.setCursor(13, 1);
+        if (!ecu_read_data) ecu_read_data = true;
+        if (digitalRead(start_out)) lcd.print("ON");
+        else lcd.print("OFF");
+        break;
+      }
+    case 5:
+      {
+        if (BackwardY) {
+          while (analogRead(joystickY) < 50) {} BackwardY = false;
+          if (digitalRead(immo_ant)) digitalWrite(immo_ant, LOW);
+          else digitalWrite(immo_ant, HIGH);
+        }
+        lcd.print("Immo");
+        lcd.setCursor(13, 1);
+        if (digitalRead(immo_ant)) lcd.print("ON");
+        else lcd.print("OFF");
+        break;
+      }
+  }
+}
+
+long universal_set(long number_set, unsigned int degrees_set, long min_set, long max_set)
+{
+  if (BackwardX) {
+    delay(30);
+    BackwardX = false;
+    number_set -= degrees_set;
+    if (number_set < min_set) number_set = min_set;
+  }
+  else if (ForwardX) {
+    delay(30);
+    ForwardX = false;
+    number_set += degrees_set;
+    if (number_set > max_set) number_set = max_set;
+  }
+  else if (ForwardY) {
+    while (analogRead(joystickY) > 970) {}
+    ForwardY = false;
+    NPage1_show = true;
+  }
+  return number_set;
+}
+
+
+
+void eeprom_write()
+{
+  byte *a = (byte *)&distance;
+  for (int i = 0; i <= 6; i++) EEPROM.write(i + 50, a[i]);
+
+  byte *b = (byte *)&fuel_tank;
+  for (int i = 0; i <= 5; i++) EEPROM.write(i + 57, b[i]);
+
+  byte *c = (byte *)&main_distance_plus;
+  for (int i = 0; i <= 6; i++) EEPROM.write(i + 63, c[i]);
+
+  byte *d = (byte *)&main_distance;
+  for (int i = 0; i <= 5; i++) EEPROM.write(i + 70, d[i]);
+
+  /* byte *e = (byte *)&boost_set;
+   for (int i = 0; i <= 4; i++) EEPROM.write(i + 76, e[i]);
+
+   byte *f = (byte *)&rpm_boost_set;
+   for (int i = 0; i <= 4; i++) EEPROM.write(i + 81, f[i]);
+
+   byte *g = (byte *)&light_delay_set;
+   for (int i = 0; i <= 4; i++) EEPROM.write(i + 86, g[i]);
+
+  */
+  //EEPROM.write(50, NPage); EEPROM.write(51, NPage1); EEPROM.write(52, NPage2);
+  //EEPROM.write(53, Booster_function); EEPROM.write(54, start_stop_enabled);
+}
+void eeprom_read()
+{
+  byte aa[6];
+  for (int i = 0; i <= 6; i++) aa[i] = EEPROM.read(i + 50);
+  float *a = (float*)&aa;
+  distance = a[0];
+
+  byte bb[5];
+  for (int i = 0; i <= 5; i++) bb[i] = EEPROM.read(i + 57);
+  float *b = (float*)&bb;
+  fuel_tank = b[0];
+
+  byte cc[6];
+  for (int i = 0; i <= 6; i++) cc[i] = EEPROM.read(i + 63);
+  float *c = (float*)&cc;
+  main_distance_plus = c[0];
+
+  byte dd[5];
+  for (int i = 0; i <= 5; i++) dd[i] = EEPROM.read(i + 70);
+  unsigned long *d = (unsigned long*)&dd;
+  main_distance = d[0];
+  /*
+    byte ee[4];
+    for (int i = 0; i <= 4; i++) ee[i] = EEPROM.read(i + 76);
+    unsigned int *e = (unsigned int*)&ee;
+    boost_set = e[0];
+
+    byte ff[4];
+    for (int i = 0; i <= 4; i++) ff[i] = EEPROM.read(i + 81);
+    unsigned int *f = (unsigned int*)&ff;
+    rpm_boost_set = f[0];
+
+    byte gg[5];
+    for (int i = 0; i <= 5; i++) gg[i] = EEPROM.read(i + 86);
+    int *g = (int*)&gg;
+    light_delay_set = g[0];
+  */
+  //NPage = EEPROM.read(50); NPage1 = EEPROM.read(51); NPage2 = EEPROM.read(52);
+  //Booster_function = EEPROM.read(53); start_stop_enabled = EEPROM.read(54);
+}
+
+
+int real_time(unsigned long incomming_time, int val)
+{
+  int hours = incomming_time / 3600;
+  incomming_time -= hours * 3600;
+  int minutes = incomming_time / 60;
+  incomming_time -= minutes * 60;
+  int seconds = incomming_time;
+  if (val == 1) return hours;
+  if (val == 2) return minutes;
+  if (val == 3) return seconds;
+}
+
+
+
+//---------------------Связь с мозгами и формулы------------------------—
+
+byte check_data24(int nbyte)
+{
+  int i;
+  if (nbyte != 24)
+  {
+    for (i = 0; i < nbyte; i++) Serial1.read();
+    return 0;
+  }
+  else
+  {
+    for (i = 0; i < 5; i++) Serial1.read(); //preamble
+    return 1;
+  }
+}
+
+void honda_read_data_00_0f()
+{
+  int i;
+  byte inData[19];
+  for (i = 0; i < 19; i++) inData[i] = Serial1.read();
+  int srpm = (inData[2] << 8 | inData[3]);
+  if (srpm > 0) rpm = 1875000 / srpm;
+  else rpm = 0;
+  vss = (int)inData[4];
+  dis08 = (int)inData[10]; //1-SW_Starter, 2-SW_AC, 3-PAS, 4-SW_Brake, 5-P_N, 8-VTECPres
+  dis09 = (int)inData[11]; //4- SCS
+  dis0A = (int)inData[12]; //3- VTS
+  dis0B = (int)inData[13]; //1-MainRelay, 2-AC_cluch, 3-O2Heater1, 6-CheckEngine, 8-O2Heater2
+  dis0C = (int)inData[14]; //1-AltC, 2-FANC, 3-IAB, 4-VTEC E, 8-Econo
+  dis0D = (int)inData[15]; //4-Mount
+  dis0E = (int)inData[16]; //------
+  dis0F = (int)inData[17]; //1-ClosedLoop
+}
+
+void honda_read_data_10_1f()
+{
+  int i;
+  byte inData[19];
+  for (i = 0; i < 19; i++) inData[i] = Serial1.read();
+  temp_cool = temp_function((float)inData[2]);
+  temp_air = temp_function((float)inData[3]);
+  abs_pres = (float)inData[4] * 0.716 - 5.0;
+  atm_pres = (float)inData[5] * 0.716 - 5.0;
+  thr_pos = (int)(((float)inData[6] - 25) / 2.06);
+  volt_lz1 = (float)inData[7] / 51.3;
+  volt_net = (float)inData[9] / 10.45;
+  load_gen = (int)inData[10] / 2.55;
+  pos_egr = (float)inData[14] / 51.3;
+}
+
+void honda_read_data_20_2f()
+{
+  int i;
+  byte inData[19];
+  for (i = 0; i < 19; i++) inData[i] = Serial1.read();
+  st_corr = (int)inData[2];
+  lt_corr = (int)inData[4];
+  time_inj = ( (float)((inData[6] << 8) | inData[7])) / 235;
+  ign = ((int)inData[8] - 128) / 2;
+  valv_idle = (float)inData[10] / 2.55;
+}
+
+// функция вычисления температуры в градусах
+int temp_function(float x)
+{
+  float result = 155.04149 - x * 3.0414878 + x * x * 0.03952185 - x * x * x * 0.00029383913 + x * x * x * x * 0.0000010792568 - x * x * x * x * x * 0.0000000015618437;
+  return (int)result;
+}
+
+// функция записи в порт
+void honda_write_data(byte x, byte y)
+{
+  Serial1.write(0x20); // command byte (read mem)
+  Serial1.write(0x05); // length in bytes
+  Serial1.write(x); // offset
+  Serial1.write(y); // Nr bytes to retun
+  Serial1.write(0x0100 - (0x20 + 0x05 + x + y)); //crc
+}
+
+
+//печать линейной шкалы в диапазоне от Rpm_min до Rpm_max
+void show_scale ( int Rpm, int Rpm_min, int Rpm_max, int RightPos )
+{
+  lcd.setCursor(RightPos, 0);
+  lcd.print(Rpm_max); //Печатаем правое значение шкалы
+  int Pos = map (Rpm, Rpm_min, Rpm_max, 0, 160); // Приводим к шкале в 160 значений (хотя у нас каждая риска — "два")
+  int End_all = int (Pos / 10); // количество полных символов
+  int Dev = int ((Pos - End_all * 10) / 2); // сколько заполнять вертикальных черточек в неполной фигуре
+  lcd.setCursor(0, 1);
+  for (int i = 0; i < End_all; i++)
+  {
+    lcd.write((byte)5); // печатаем полные квадратики
+  }
+  switch (Dev) { // выбираем какую неполную фигуру напечатать
+    case 1:
+      lcd.write((byte)0);
+      break;
+    case 2:
+      lcd.write((byte)1);
+      break;
+    case 3:
+      lcd.write((byte)2);
+      break;
+    case 4:
+      lcd.write((byte)3);
+      break;
+    default:
+      lcd.print (" "); // забьем справа пробельчиками
+  }
+}
+
+void gsm_arduino_rx() {
+  currStr = "";   currSymb = 0;
+  while (Serial2.available()) {
+    currSymb = Serial2.read();
+    if (currSymb == '\n')    break;
+    if (currSymb > 0 && currSymb != '\r')  {
+      currStr += currSymb;
+    }
+    delay(5);
+  }
+  read_data = 0;  firstMillis = 0; ecu_read_data = true;
+}
+void gsm_read() {
+  if (!Serial2.available()) return;
+  gsm_arduino_rx();
+  //Serial.println(currStr);
+  if (currStr == "Motor ON" && actual_mode != 3) {
+    actual_mode = 2;  left_start_try = 1;
+    started_from_gsm = true;
+    digitalWrite(immo_ant, HIGH);
+    digitalWrite(pwr_out, HIGH);
+    digitalWrite(Plight_out, HIGH);
+    delay(100);
+    digitalWrite(ign1_out, HIGH);    digitalWrite(ign2_out, HIGH);
+  }
+  else if (currStr == "Motor OFF") {
+    if (vss == 0)    do_shutdown();
+    else if (actual_mode != 3)  {
+      digitalWrite(immo_ant, LOW);
+      digitalWrite(pwr_out, LOW);
+      digitalWrite(ign1_out, LOW);
+      digitalWrite(ign2_out, LOW);
+      digitalWrite(start_out, LOW);
+      digitalWrite(Plight_out, LOW);
+      digitalWrite(Fog_out, LOW);
+      digitalWrite(Head_out, LOW);
+      lcd.noDisplay();
+      knob_light_off();
+    }
+  }
+  else if (currStr == "Fog ON") {
+    digitalWrite(pwr_out, HIGH);
+    digitalWrite(Fog_out, HIGH);
+  }
+  else if (currStr == "Fog OFF") {
+    digitalWrite(Fog_out, LOW);
+    if (actual_mode == 0) digitalWrite(pwr_out, LOW);
+  }
+  else if (currStr == "Park ON")  {
+    digitalWrite(pwr_out, HIGH);
+    digitalWrite(Plight_out, HIGH);
+  }
+  else if (currStr == "Park OFF")   {
+    digitalWrite(Plight_out, LOW);
+    if (actual_mode == 0) digitalWrite(pwr_out, LOW);
+  }
+  else if (currStr == "Head ON")      digitalWrite(Head_out, HIGH);
+  else if (currStr == "Head OFF")     digitalWrite(Head_out, LOW);
+  else if (currStr == "Music ON")     digitalWrite(pwr_out, HIGH);
+  else if (currStr == "Music OFF")    digitalWrite(pwr_out, LOW);
+  else if (currStr == "STOP") {
+    tx.pause = true;
+    while (!rx.received) {
+      ETout.sendData(); ETin.receiveData();
+    }
+    rx.received = false;
+  }
+  else if (currStr == "OK") {
+    tx.pause = false;
+    while (!rx.received) {
+      ETout.sendData(); ETin.receiveData();
+    }
+    rx.received = false;
+  }
+  else if (currStr == "Motor INFO")  {}
+  else {
+    lcd.clear();  lcd.setCursor(0, 0);
+    lcd.print(currStr);
+    delayAnyButPushed(5000);
+  }
+}
+
+boolean anyButPushed() {
+  if (ForwardX || BackwardX || ForwardY || BackwardY || !digitalRead(knob) || !digitalRead(joystickBUT) || !digitalRead(btn1) || !digitalRead(btn2))   return 1;
+  else return 0;
+}
+void delayAnyButPushed(unsigned long delay_time)  {
+  delay_time += millis();
+  while (millis() < delay_time) {
+    if (anyButPushed()) break;
+  }
+}
+boolean delayButReleased(uint32_t button, unsigned long delay_time)  {
+  delay_time += millis();
+  while (millis() < delay_time) {
+    if (digitalRead(button)) return 1;
+  }
+  return 0;
+}
+boolean delayButPushed(uint32_t button, unsigned long delay_time)  {
+  delay_time += millis();
+  while (millis() < delay_time) {
+    if (!digitalRead(button)) return 1;
+  }
+  return 0;
+}
